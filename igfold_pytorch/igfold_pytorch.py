@@ -10,8 +10,8 @@ class Residual(nn.Module):
         super().__init__()
         self.fn = fn
     
-    def forward(self, x):
-        return self.fn(x) + x
+    def forward(self, x, **kwargs):
+        return self.fn(x, **kwargs) + x
 
 class GatedResidual(nn.Module):
     def __init__(self, fn):
@@ -150,8 +150,8 @@ def euclidean_transform(x, r, t):
     """
     # infer number of heads
     n = x.size(1)
-    r = repeat(r, 'b l a b -> b n l a b', n=n)
-    t = repeat(t, 'b l a -> b n l () a', n=n)
+    r = repeat(r, 'b l x y -> b n l x y', n=n)
+    t = repeat(t, 'b l x -> b n l () x', n=n)
 
     return einsum('b n l d k, b n l k c -> b n l d c', x, r) + t
 
@@ -161,8 +161,8 @@ def inverse_euclidean_transform(x, r, t):
     """
     # infer number of heads
     n = x.size(1)
-    r_inv = repeat(r, 'b l a b -> b n l b a', n=n)  # note that R^-1 = R^T
-    t = repeat(t, 'b l a -> b n l () a', n=n)
+    r_inv = repeat(r, 'b l x y  -> b n l y x', n=n)  # note that R^-1 = R^T
+    t = repeat(t, 'b l x -> b n l () x', n=n)
 
     return einsum('b n l d k, b n l k c -> b n l d c', x - t, r_inv)
     
@@ -193,9 +193,9 @@ class InvariantPointAttention(nn.Module):
         self.to_k_point = nn.Linear(d_orig, d_point, bias=False)
         self.to_v_point = nn.Linear(d_orig, d_point, bias=False)
         self.scale_point = (4.5 * d_head_point) ** -0.5
+        self.gamma = nn.Parameter(torch.log(torch.exp(torch.ones(n_head)) - 1.0))
 
-        self.to_out = nn.Linear(d_scalar + d_orig + d_point + (d_head_point * n_head), d_orig)
-
+        self.to_out = nn.Linear(d_scalar + d_orig * n_head + d_point + (d_head_point * n_head), d_orig)
 
     def forward(self, x, e, r, t):
         q_scalar = self.to_q_scalar(x)
@@ -225,20 +225,23 @@ class InvariantPointAttention(nn.Module):
         logit_scalar = einsum('b n i d, b n j d -> b n i j', q_scalar, k_scalar) * self.scale_scalar
 
         # modulation by pair representation
-        bias_pair = self.to_pair_bias(e)
+        bias_pair = rearrange(self.to_pair_bias(e), 'b i j n -> b n i j')
 
         # point attention
         all_pairwise_diff = rearrange(q_point, 'b n i p c -> b n i () p c') - rearrange(k_point, 'b n j p c -> b n () j p c')
         gamma = rearrange(self.gamma, 'n -> () n () ()')
 
         # note 18**-0.5 for w_c
-        logit_point = -0.5 * 0.25 * gamma * (all_pairwise_diff**2).sum(dim=-1).sum(dim=-2)
+        logit_point = -0.5 * 0.25 * gamma * (all_pairwise_diff**2).sum(dim=-1).sum(dim=-1)
 
         logit = (3**-0.5) * (logit_scalar + bias_pair + logit_point)
         attn = logit.softmax(dim=-1)
 
-        out_scalar = einsum('b n i j, b n j d -> b i (n d)', attn, v_scalar)
-        out_pair = einsum('b n i j, b n i j d -> b i (n d)', attn, e)
+        out_scalar = einsum('b n i j, b n j d -> b n i d', attn, v_scalar)
+        out_scalar = rearrange(out_scalar, 'b n i d -> b i (n d)')
+
+        out_pair = einsum('b n i j, b i j d -> b n i d', attn, e)
+        out_pair = rearrange(out_pair, 'b n i d -> b i (n d)')
 
         out_point = einsum('b n i j, b n j p c -> b n i p c', attn, v_point)
         out_point = inverse_euclidean_transform(out_point, r, t)
@@ -253,7 +256,13 @@ class InvariantPointAttention(nn.Module):
         return x
     
 class InvariantPointAttentionBlock(nn.Module):
-    def __init__(self, d_orig=64):
+    def __init__(
+            self,
+            d_orig=64,
+            d_head_scalar=16,
+            d_head_point=4,
+            n_head=8,
+        ):
         super().__init__()
 
         self.ipa = Residual(InvariantPointAttention(d_orig, d_head_scalar, d_head_point, n_head))
@@ -310,26 +319,28 @@ class IGFold(nn.Module):
         return x, e
 
 if __name__ == '__main__':
-    # x = torch.randn([1, 128, 512])
-    # e = torch.randn([1, 128, 128, 512])
+    x = torch.randn([1, 128, 512])
+    e = torch.randn([1, 128, 128, 512])
+    r = torch.randn([1, 128, 3, 3])
+    t = torch.randn([1, 128, 3])
 
-    # model = IGFold()
-    # x, e = model(x, e)
-    # print(x.shape)
-    # print(e.shape)
+    model = IGFold()
+    x, e = model(x, e, r, t)
+    print(x.shape)
+    print(e.shape)
 
-    q_point = torch.randn([1, 8, 128, 4, 3])
-    k_point = torch.randn([1, 8, 128, 4, 3])
+    # q_point = torch.randn([1, 8, 128, 4, 3])
+    # k_point = torch.randn([1, 8, 128, 4, 3])
 
-    gamma = torch.randn(8)
-    g = repeat(F.softplus(gamma), 'n -> b n () ()', b=1)
+    # gamma = torch.randn(8)
+    # g = repeat(F.softplus(gamma), 'n -> b n () ()', b=1)
 
-    all_pairwise_diff = rearrange(q_point, 'b n i p c -> b n i () p c') - rearrange(k_point, 'b n j p c -> b n () j p c')
+    # all_pairwise_diff = rearrange(q_point, 'b n i p c -> b n i () p c') - rearrange(k_point, 'b n j p c -> b n () j p c')
 
-    dist = g * (all_pairwise_diff**2).sum(dim=-1).sum(dim=-2)
-    print(dist.sum())
+    # dist = g * (all_pairwise_diff**2).sum(dim=-1).sum(dim=-2)
+    # print(dist.sum())
 
-    g = rearrange(F.softplus(gamma), 'n -> () n () () ()')
-    dist = (all_pairwise_diff**2).sum(dim=-2)
-    dist = (g * dist).sum(dim=-1)
-    print(dist.sum())
+    # g = rearrange(F.softplus(gamma), 'n -> () n () () ()')
+    # dist = (all_pairwise_diff**2).sum(dim=-2)
+    # dist = (g * dist).sum(dim=-1)
+    # print(dist.sum())
