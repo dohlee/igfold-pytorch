@@ -1,0 +1,1 @@
+from igfold_pytorch.igfold_pytorch import IgFold
