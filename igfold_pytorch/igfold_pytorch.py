@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from torch import einsum
-from einops import rearrange
+from einops import rearrange, repeat
 
 class Residual(nn.Module):
     def __init__(self, fn):
@@ -144,8 +144,143 @@ class IGFoldLayer(nn.Module):
         e = self.tm(e)
         return x, e
 
+def euclidean_transform(x, r, t):
+    """r: rotation matrix of size (b, l, 3, 3)
+    t: translation vector of size (b, l, 3)
+    """
+    # infer number of heads
+    n = x.size(1)
+    r = repeat(r, 'b l a b -> b n l a b', n=n)
+    t = repeat(t, 'b l a -> b n l () a', n=n)
+
+    return einsum('b n l d k, b n l k c -> b n l d c', x, r) + t
+
+def inverse_euclidean_transform(x, r, t):
+    """r: rotation matrix of size (b, l, 3, 3)
+    t: translation vector of size (b, l, 3)
+    """
+    # infer number of heads
+    n = x.size(1)
+    r_inv = repeat(r, 'b l a b -> b n l b a', n=n)  # note that R^-1 = R^T
+    t = repeat(t, 'b l a -> b n l () a', n=n)
+
+    return einsum('b n l d k, b n l k c -> b n l d c', x - t, r_inv)
+    
+class InvariantPointAttention(nn.Module):
+    def __init__(
+            self,
+            d_orig,
+            d_head_scalar=16,
+            d_head_point=4,
+            n_head=8,
+        ):
+        super().__init__()
+        self.n_head = n_head
+
+        # standard self-attention (scalar attention)
+        d_scalar = d_head_scalar * n_head
+        self.to_q_scalar = nn.Linear(d_orig, d_scalar, bias=False)
+        self.to_k_scalar = nn.Linear(d_orig, d_scalar, bias=False)
+        self.to_v_scalar = nn.Linear(d_orig, d_scalar, bias=False)
+        self.scale_scalar = d_head_scalar ** -0.5
+
+        # modulation by pair representation
+        self.to_pair_bias = nn.Linear(d_orig, n_head, bias=False)
+
+        # point attention
+        d_point = (d_head_point * 3) * n_head 
+        self.to_q_point = nn.Linear(d_orig, d_point, bias=False)
+        self.to_k_point = nn.Linear(d_orig, d_point, bias=False)
+        self.to_v_point = nn.Linear(d_orig, d_point, bias=False)
+        self.scale_point = (4.5 * d_head_point) ** -0.5
+
+        self.to_out = nn.Linear(d_scalar + d_orig + d_point + (d_head_point * n_head), d_orig)
+
+
+    def forward(self, x, e, r, t):
+        q_scalar = self.to_q_scalar(x)
+        k_scalar = self.to_k_scalar(x)
+        v_scalar = self.to_v_scalar(x)
+
+        q_scalar, k_scalar, v_scalar = map(
+            lambda t: rearrange(t, 'b l (n d) -> b n l d', n=self.n_head),
+            (q_scalar, k_scalar, v_scalar)
+        )
+
+        q_point = self.to_q_point(x)
+        k_point = self.to_k_point(x)
+        v_point = self.to_v_point(x)
+
+        q_point, k_point, v_point = map(
+            lambda t: rearrange(t, 'b l (n p c) -> b n l p c', n=self.n_head, c=3),
+            (q_point, k_point, v_point)
+        )
+
+        q_point, k_point, v_point = map(
+            lambda v: euclidean_transform(v, r, t),
+            (q_point, k_point, v_point),
+        )
+
+        # standard self-attention (scalar attention)
+        logit_scalar = einsum('b n i d, b n j d -> b n i j', q_scalar, k_scalar) * self.scale_scalar
+
+        # modulation by pair representation
+        bias_pair = self.to_pair_bias(e)
+
+        # point attention
+        all_pairwise_diff = rearrange(q_point, 'b n i p c -> b n i () p c') - rearrange(k_point, 'b n j p c -> b n () j p c')
+        gamma = rearrange(self.gamma, 'n -> () n () ()')
+
+        # note 18**-0.5 for w_c
+        logit_point = -0.5 * 0.25 * gamma * (all_pairwise_diff**2).sum(dim=-1).sum(dim=-2)
+
+        logit = (3**-0.5) * (logit_scalar + bias_pair + logit_point)
+        attn = logit.softmax(dim=-1)
+
+        out_scalar = einsum('b n i j, b n j d -> b i (n d)', attn, v_scalar)
+        out_pair = einsum('b n i j, b n i j d -> b i (n d)', attn, e)
+
+        out_point = einsum('b n i j, b n j p c -> b n i p c', attn, v_point)
+        out_point = inverse_euclidean_transform(out_point, r, t)
+        out_point_norm = out_point.norm(dim=-1, keepdim=True)
+
+        out_point = rearrange(out_point, 'b n i p c -> b i (n p c)')
+        out_point_norm = rearrange(out_point_norm, 'b n i p c -> b i (n p c)')
+
+        out = torch.cat([out_scalar, out_pair, out_point, out_point_norm], dim=-1)
+        x = self.to_out(out)
+
+        return x
+    
+class InvariantPointAttentionBlock(nn.Module):
+    def __init__(self, d_orig=64):
+        super().__init__()
+
+        self.ipa = Residual(InvariantPointAttention(d_orig, d_head_scalar, d_head_point, n_head))
+        self.ln1 = nn.LayerNorm(d_orig)
+        self.ff = Residual(nn.Sequential(
+            nn.Linear(d_orig, d_orig),
+            nn.ReLU(),
+            nn.Linear(d_orig, d_orig),
+            nn.ReLU(),
+            nn.Linear(d_orig, d_orig),
+        ))
+        self.ln2 = nn.LayerNorm(d_orig)
+
+    def forward(self, x, e, r, t):
+        x = self.ln1(self.ipa(x, e=e, r=r, t=t))
+        x = self.ln2(self.ff(x))
+        return x
+
 class IGFold(nn.Module):
-    def __init__(self, d_orig=64, d_head=32, n_head=8, n_layers=4):
+    def __init__(
+            self,
+            d_orig=64,
+            d_head=32,
+            n_head=8,
+            n_graph_transformer_layers=4,
+            n_ipa_temp_layers=2,
+        ):
         super().__init__()
         self.node_proj = nn.Sequential(
             nn.LazyLinear(d_orig), nn.ReLU(), nn.LayerNorm(d_orig)
@@ -154,24 +289,47 @@ class IGFold(nn.Module):
             nn.LazyLinear(d_orig), nn.ReLU(), nn.LayerNorm(d_orig)
         )
 
-        self.layers = nn.ModuleList([
-            IGFoldLayer(d_orig, d_head, n_head) for _ in range(n_layers)
+        self.graph_transformer_layers = nn.ModuleList([
+            IGFoldLayer(d_orig, d_head, n_head) for _ in range(n_graph_transformer_layers)
         ])
 
-    def forward(self, x, e):
+        self.ipa_temp_layers = nn.ModuleList([
+            InvariantPointAttentionBlock(d_orig) for _ in range(n_ipa_temp_layers)
+        ])
+
+    def forward(self, x, e, r, t):
         x = self.node_proj(x)
         e = self.edge_proj(e)
 
-        for layer in self.layers:
+        for layer in self.graph_transformer_layers:
             x, e = layer(x, e)
+        
+        for layer in self.ipa_temp_layers:
+            x = layer(x, e, r, t)
         
         return x, e
 
 if __name__ == '__main__':
-    x = torch.randn([1, 128, 512])
-    e = torch.randn([1, 128, 128, 512])
+    # x = torch.randn([1, 128, 512])
+    # e = torch.randn([1, 128, 128, 512])
 
-    model = IGFold()
-    x, e = model(x, e)
-    print(x.shape)
-    print(e.shape)
+    # model = IGFold()
+    # x, e = model(x, e)
+    # print(x.shape)
+    # print(e.shape)
+
+    q_point = torch.randn([1, 8, 128, 4, 3])
+    k_point = torch.randn([1, 8, 128, 4, 3])
+
+    gamma = torch.randn(8)
+    g = repeat(F.softplus(gamma), 'n -> b n () ()', b=1)
+
+    all_pairwise_diff = rearrange(q_point, 'b n i p c -> b n i () p c') - rearrange(k_point, 'b n j p c -> b n () j p c')
+
+    dist = g * (all_pairwise_diff**2).sum(dim=-1).sum(dim=-2)
+    print(dist.sum())
+
+    g = rearrange(F.softplus(gamma), 'n -> () n () () ()')
+    dist = (all_pairwise_diff**2).sum(dim=-2)
+    dist = (g * dist).sum(dim=-1)
+    print(dist.sum())
