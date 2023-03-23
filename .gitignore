@@ -2,6 +2,7 @@ data/
 note/.ipynb_checkpoints/
 *.egg-info/
 **/__pycache__/
+note/
 wandb/
 **/.snakemake
 tuning/results

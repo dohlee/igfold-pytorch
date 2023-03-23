@@ -292,12 +292,13 @@ class BackboneUpdate(nn.Module):
     def forward(self, x):
         bsz, length = x.shape[:2]
 
-        a = torch.ones(bsz, length, 1)
+        a = torch.ones(bsz, length)
+
         b, c, d = self.to_bcd(x).unbind(dim=-1)
         denom = (1 + b**2 + c**2 + d**2) ** -0.5
         a, b, c, d = a * denom, b * denom, c * denom, d * denom
 
-        r = torch.cat([
+        r = torch.stack([
             a**2 + b**2 - c**2 - d**2,
             2*b*c - 2*a*d,
             2*b*d + 2*a*c,
@@ -307,7 +308,7 @@ class BackboneUpdate(nn.Module):
             2*b*d - 2*a*c,
             2*c*d + 2*a*b,
             a**2 - b**2 - c**2 + d**2,
-        ])
+        ], dim=-1)
         r = rearrange(r, '... (r1 r2) -> ... r1 r2', r1=3, r2=3)
 
         t = self.to_t(x)
@@ -358,6 +359,7 @@ class IGFold(nn.Module):
         for layer in self.ipa_temp_layers:
             x = layer(x, e, r, t)
 
+        # initialize coordinate frame to be at origin
         r_scratch = repeat(torch.eye(3, 3), 'r1 r2 -> b l r1 r2', b=bsz, l=length)
         t_scratch = repeat(torch.zeros(3), 't -> b l t', b=bsz, l=length)
 
@@ -367,8 +369,19 @@ class IGFold(nn.Module):
 
             r_scratch = torch.matmul(r_scratch, r_update)
             t_scratch = torch.matmul(r_scratch, t_update.unsqueeze(-1)).squeeze(-1) + t_scratch
-        
-        return x, e
+
+        # atom coordinates of ideal peptide bonds
+        coords = torch.tensor([[0, 0, -1.4580], [0, 0, 0], [-1.1932, -0.7685, 0.5513], [0, 1.4260, 0.5310]])
+        coords = repeat(coords, 'n d -> b l n d', b=bsz, l=length)
+
+        # apply backbone update to atom coordinates
+        coords = einsum('b l n d, b l d r -> b l n r', coords, r_scratch) + rearrange(t_scratch, 'b l d -> b l () d')
+
+        return {
+            'x': x,
+            'e': e,
+            'coords': coords,
+        }
 
 if __name__ == '__main__':
     x = torch.randn([1, 128, 512])
@@ -377,9 +390,11 @@ if __name__ == '__main__':
     t = torch.randn([1, 128, 3])
 
     model = IGFold()
-    x, e = model(x, e, r, t)
-    print(x.shape)
-    print(e.shape)
+    out = model(x, e, r, t)
+
+    print(out['x'].shape)
+    print(out['e'].shape)
+    print(out['coords'].shape)
 
     # q_point = torch.randn([1, 8, 128, 4, 3])
     # k_point = torch.randn([1, 8, 128, 4, 3])
