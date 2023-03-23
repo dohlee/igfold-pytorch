@@ -280,6 +280,38 @@ class InvariantPointAttentionBlock(nn.Module):
         x = self.ln1(self.ipa(x, e=e, r=r, t=t))
         x = self.ln2(self.ff(x))
         return x
+    
+class BackboneUpdate(nn.Module):
+    def __init__(self, d_orig=64):
+        super().__init__()
+        # quarternion
+        self.to_bcd = nn.Linear(d_orig, 3)
+        # translation
+        self.to_t = nn.Linear(d_orig, 3)
+    
+    def forward(self, x):
+        bsz, length = x.shape[:2]
+
+        a = torch.ones(bsz, length, 1)
+        b, c, d = self.to_bcd(x).unbind(dim=-1)
+        denom = (1 + b**2 + c**2 + d**2) ** -0.5
+        a, b, c, d = a * denom, b * denom, c * denom, d * denom
+
+        r = torch.cat([
+            a**2 + b**2 - c**2 - d**2,
+            2*b*c - 2*a*d,
+            2*b*d + 2*a*c,
+            2*b*c + 2*a*d,
+            a**2 - b**2 + c**2 - d**2,
+            2*c*d - 2*a*b,
+            2*b*d - 2*a*c,
+            2*c*d + 2*a*b,
+            a**2 - b**2 - c**2 + d**2,
+        ])
+        r = rearrange(r, '... (r1 r2) -> ... r1 r2', r1=3, r2=3)
+
+        t = self.to_t(x)
+        return r, t
 
 class IGFold(nn.Module):
     def __init__(
@@ -289,6 +321,7 @@ class IGFold(nn.Module):
             n_head=8,
             n_graph_transformer_layers=4,
             n_ipa_temp_layers=2,
+            n_ipa_struct_layers=3,
         ):
         super().__init__()
         self.node_proj = nn.Sequential(
@@ -306,7 +339,16 @@ class IGFold(nn.Module):
             InvariantPointAttentionBlock(d_orig) for _ in range(n_ipa_temp_layers)
         ])
 
+        self.ipa_struct_layers = nn.ModuleList([
+            InvariantPointAttentionBlock(d_orig) for _ in range(n_ipa_struct_layers)
+        ])
+        self.backbone_update_layers = nn.ModuleList([
+            BackboneUpdate(d_orig) for _ in range(n_ipa_struct_layers)
+        ])
+
     def forward(self, x, e, r, t):
+        bsz, length = x.shape[:2]
+
         x = self.node_proj(x)
         e = self.edge_proj(e)
 
@@ -315,6 +357,16 @@ class IGFold(nn.Module):
         
         for layer in self.ipa_temp_layers:
             x = layer(x, e, r, t)
+
+        r_scratch = repeat(torch.eye(3, 3), 'r1 r2 -> b l r1 r2', b=bsz, l=length)
+        t_scratch = repeat(torch.zeros(3), 't -> b l t', b=bsz, l=length)
+
+        for layer, update in zip(self.ipa_struct_layers, self.backbone_update_layers):
+            x = layer(x, e, r_scratch, t_scratch)
+            r_update, t_update = update(x)
+
+            r_scratch = torch.matmul(r_scratch, r_update)
+            t_scratch = torch.matmul(r_scratch, t_update.unsqueeze(-1)).squeeze(-1) + t_scratch
         
         return x, e
 
