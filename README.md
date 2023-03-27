@@ -9,6 +9,20 @@ Re-implementation of IgFold, a fast antibody structure prediction method, in PyT
 $ pip install igfold-pytorch
 ```
 
+## Usage
+```python
+from igfold_pytorch import IgFold
+
+bsz = 1
+x = torch.randn([bsz, 128, 512])        # Embedding vectors from AntiBERTy
+e = torch.randn([bsz, 128, 128, 512])   # Attention matrices from AntiBERTy
+r = torch.randn([bsz, 128, 512])        # Template backbone rotations
+t = torch.randn([bsz, 128, 512])        # Template backbone translations
+
+model = IgFold()
+result = model(x, e, r, t) # result['x'], result['e'], result['coords']
+```
+
 ## Citation
 ```bibtex
 @article{ruffolo2022fast,
